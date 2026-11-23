@@ -1,0 +1,26 @@
+services:
+  server:
+    build: .
+    init: true
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+
+  # Terminal client: docker compose run --rm client
+  client:
+    build: .
+    profiles: ["client"]
+    depends_on:
+      - server
+    stdin_open: true
+    tty: true
+    working_dir: /data
+    command: ["python", "/app/ascii_chess.py"]
+    environment:
+      TERM: xterm-256color
+      CHESSCORE_SERVER: ws://server:8765
+    volumes:
+      - chess-data:/data
+
+volumes:
+  chess-data:
