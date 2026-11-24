@@ -1,6 +1,8 @@
 """Tests for notation and board-display helpers. Run with:  py -m unittest test_notation -v"""
 
+import re
 import unittest
+from unittest.mock import patch
 
 import ascii_chess as ac
 
@@ -50,6 +52,44 @@ class NotationTests(unittest.TestCase):
 
 
 class DisplayHelperTests(unittest.TestCase):
+    def test_expanded_board_keeps_squares_markers_and_flipped_coordinates(self):
+        game = ac.new_game()
+        ui = ac.new_ui()
+        ui["selected"] = (6, 4)
+        ui["targets"] = {(4, 4): False, (5, 5): True}
+        lines = ac.build_board_lines(game, ui, flip=True, cell_width=5, cell_height=2)
+        plain = [re.sub(r"\033\[[0-9;]*m", "", line) for line in lines]
+        self.assertEqual(len(lines), 27)
+        self.assertEqual(len(plain[2]), 54)
+        self.assertEqual(plain[0].split(), list("hgfedcba"))
+        self.assertTrue(plain[2].startswith(" 1 │"))
+        self.assertIn("{♙}", "\n".join(plain))
+        self.assertIn("○", "\n".join(plain))
+        self.assertIn("✕", "\n".join(plain))
+        self.assertNotIn("♙", plain[3])
+
+    def test_board_expands_only_when_window_and_footer_fit(self):
+        game, ui = ac.new_game(), ac.new_ui()
+        for width, height, footer, expected_width, expected_height in [
+            (72, 22, (), 38, 19),
+            (80, 30, (), 38, 27),
+            (87, 30, (), 38, 27),
+            (88, 30, (), 54, 27),
+            (88, 32, ("chat", "", ""), 38, 19),
+            (88, 33, ("chat", "", ""), 54, 27),
+        ]:
+            with self.subTest(width=width, height=height, footer=footer), \
+                    patch.object(ac, "terminal_width", return_value=width), \
+                    patch.object(ac, "terminal_height", return_value=height), \
+                    patch.object(ac, "draw_frame") as draw:
+                ac.render_game(game, ui, "playing", footer=footer)
+                lines = [re.sub(r"\033\[[0-9;]*m", "", line) for line in draw.call_args.args[0]]
+                border = next(line.lstrip().split("┐")[0] + "┐" for line in lines if "┌" in line)
+                self.assertEqual(len(border), expected_width - 5)
+                self.assertEqual(sum(line.count("│") == 9 for line in lines),
+                                 8 * (2 if expected_height == 27 else 1))
+                self.assertLessEqual(len(lines), height)
+
     def test_captured_pieces_and_material(self):
         game = play(["e2e4", "d7d5", "e4d5", "d8d5"])
         self.assertEqual(ac.captured_pieces(game["board"], "w"), ["p"])

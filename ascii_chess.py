@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -30,6 +31,7 @@ WHITE = "\033[97m"
 YELLOW = "\033[93m"
 RED = "\033[91m"
 RESET = "\033[0m"
+BLUE = "\033[94m"
 
 LIGHT_SQUARE = "\033[48;5;238m"
 DARK_SQUARE = "\033[48;5;234m"
@@ -50,6 +52,7 @@ ROOK_DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
 PROMOTION_CHOICES = ["q", "r", "b", "n"]
 FINAL_STATUSES = ("checkmate", "stalemate", "draw")
+COMPUTER_LEVELS = {"easy": (0, 200), "intermediate": (10, 500), "hard": (20, 1000)}
 
 LETTER_ART = {
     "C": [" ██████╗", "██╔════╝", "██║     ", "██║     ", "╚██████╗", " ╚═════╝"],
@@ -86,7 +89,7 @@ def new_game():
 
 
 def copy_state(state):
-    return {
+    copied = {
         "board": [row[:] for row in state["board"]],
         "turn": state["turn"],
         "castling": dict(state["castling"]),
@@ -95,6 +98,9 @@ def copy_state(state):
         "fullmove": state["fullmove"],
         "history": list(state["history"]),
     }
+    if "computer" in state:
+        copied["computer"] = state["computer"]
+    return copied
 
 
 def in_bounds(row, col):
@@ -423,6 +429,8 @@ def is_valid_state(data):
             return False
         if data["turn"] not in ("w", "b"):
             return False
+        if "computer" in data and data["computer"] not in COMPUTER_LEVELS:
+            return False
         if set(data["castling"]) != {"wK", "wQ", "bK", "bQ"}:
             return False
         ep = data["en_passant"]
@@ -463,7 +471,7 @@ def load_game(path=SAVE_FILE):
 
 
 # ============================================================
-# ENGINE SUPPORT (Stockfish can be plugged in later via UCI)
+# STOCKFISH ENGINE SUPPORT
 # ============================================================
 
 def state_to_fen(state):
@@ -500,33 +508,80 @@ def send_to_engine(engine, command):
 
 
 def read_engine_until(engine, prefix):
+    deadline = time.monotonic() + 15
     while True:
-        line = engine.stdout.readline()
-        if not line:
-            return None
+        try:
+            line = engine.uci_lines.get(timeout=max(0, deadline - time.monotonic()))
+        except queue.Empty:
+            raise RuntimeError(f"Stockfish timed out waiting for {prefix}.") from None
+        if line is None:
+            raise RuntimeError(f"Stockfish stopped before sending {prefix}.")
         if line.startswith(prefix):
             return line.strip()
+
+
+def stockfish_path():
+    configured = os.environ.get("CHESSCORE_STOCKFISH")
+    if configured:
+        return configured
+    base = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    name = "stockfish.exe" if os.name == "nt" else "stockfish"
+    for path in (os.path.join(base, name), os.path.join(base, "stockfish", name),
+                 os.path.join(base, "stockfish", "src", name),
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "stockfish", name)):
+        if os.path.isfile(path):
+            return path
+    return shutil.which("stockfish") or name
 
 
 def start_engine(path):
     engine = subprocess.Popen(
         [path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        text=True, bufsize=1, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        stderr=subprocess.STDOUT, text=True, bufsize=1,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    send_to_engine(engine, "uci")
-    read_engine_until(engine, "uciok")
+    engine.uci_lines = queue.Queue()
+
+    def collect_output():
+        try:
+            for line in engine.stdout:
+                engine.uci_lines.put(line)
+        finally:
+            engine.uci_lines.put(None)
+
+    threading.Thread(target=collect_output, daemon=True).start()
+    try:
+        send_to_engine(engine, "uci")
+        read_engine_until(engine, "uciok")
+        send_to_engine(engine, "isready")
+        read_engine_until(engine, "readyok")
+    except (OSError, RuntimeError):
+        stop_engine(engine)
+        raise
+    return engine
+
+
+def configure_engine(engine, level):
+    skill, _ = COMPUTER_LEVELS[level]
+    send_to_engine(engine, f"setoption name Skill Level value {skill}")
+    send_to_engine(engine, "ucinewgame")
     send_to_engine(engine, "isready")
     read_engine_until(engine, "readyok")
-    return engine
 
 
 def engine_best_move(engine, state, movetime_ms=500):
     send_to_engine(engine, f"position fen {state_to_fen(state)}")
     send_to_engine(engine, f"go movetime {movetime_ms}")
     line = read_engine_until(engine, "bestmove")
-    if line is None or line.split()[1] == "(none)":
-        return None
-    return uci_to_move(line.split()[1])
+    parts = line.split()
+    if len(parts) < 2 or not re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", parts[1]):
+        raise RuntimeError(f"Stockfish returned an invalid move: {line}")
+    frm, to, promotion = uci_to_move(parts[1])
+    if to not in legal_moves(state, *frm):
+        raise RuntimeError(f"Stockfish returned an illegal move: {parts[1]}")
+    if is_promotion_move(state, frm, to) != (promotion is not None):
+        raise RuntimeError(f"Stockfish returned an invalid promotion: {parts[1]}")
+    return frm, to, promotion
 
 
 def stop_engine(engine):
@@ -534,7 +589,17 @@ def stop_engine(engine):
         send_to_engine(engine, "quit")
     except OSError:
         pass
-    engine.terminate()
+    try:
+        engine.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        engine.kill()
+        engine.wait()
+    try:
+        engine.stdin.close()
+    except OSError:
+        pass
+    finally:
+        engine.stdout.close()
 
 
 # ============================================================
@@ -679,7 +744,7 @@ def last_move_squares(game):
     return {frm, to}
 
 
-def render_cell(game, ui, row, col, last_move=(), check_square=None):
+def render_cell(game, ui, row, col, last_move=(), check_square=None, width=3, blank=False):
     piece = game["board"][row][col]
     square = (row, col)
     glyph = PIECE_GLYPHS[piece] if piece else " "
@@ -701,28 +766,35 @@ def render_cell(game, ui, row, col, last_move=(), check_square=None):
         background = LAST_MOVE_SQUARE
     else:
         background = LIGHT_SQUARE if (row + col) % 2 == 0 else DARK_SQUARE
-    return f"{background}{GREEN}{left}{color}{glyph}{GREEN}{right}{RESET}"
+    if blank:
+        return f"{background}{' ' * width}{RESET}"
+    padding = " " * ((width - 3) // 2)
+    return f"{background}{padding}{GREEN}{left}{color}{glyph}{GREEN}{right}{padding}{RESET}"
 
 
-def build_board_lines(game, ui, flip=False):
+def build_board_lines(game, ui, flip=False, cell_width=3, cell_height=1):
     border = lambda text: f"{DIM_GREEN}{text}{RESET}"
     rows = range(7, -1, -1) if flip else range(8)
     cols = range(7, -1, -1) if flip else range(8)
     files = FILES[::-1] if flip else FILES
-    header = border("     " + "   ".join(files))
+    header = border(" " * (4 + cell_width // 2) + (" " * cell_width).join(files))
     last_move = last_move_squares(game)
     check_square = find_king(game["board"], game["turn"]) if is_in_check(game["board"], game["turn"]) else None
-    lines = [header, border("   ┌" + "───┬" * 7 + "───┐")]
+    horizontal = "─" * cell_width
+    lines = [header, border("   ┌" + (horizontal + "┬") * 7 + horizontal + "┐")]
 
     for position, row in enumerate(rows):
-        cells = "".join(
-            render_cell(game, ui, row, col, last_move, check_square) + border("│") for col in cols
-        )
-        lines.append(border(f" {8 - row} │") + cells + border(f" {8 - row}"))
+        for line in range(cell_height):
+            cells = "".join(
+                render_cell(game, ui, row, col, last_move, check_square, cell_width, blank=line > 0) + border("│")
+                for col in cols
+            )
+            rank = str(8 - row) if line == 0 else " "
+            lines.append(border(f" {rank} │") + cells + border(f" {rank}"))
         if position < 7:
-            lines.append(border("   ├" + "───┼" * 7 + "───┤"))
+            lines.append(border("   ├" + (horizontal + "┼") * 7 + horizontal + "┤"))
 
-    lines.append(border("   └" + "───┴" * 7 + "───┘"))
+    lines.append(border("   └" + (horizontal + "┴") * 7 + horizontal + "┘"))
     lines.append(header)
     return lines
 
@@ -802,8 +874,11 @@ def draw_notice(lines):
 def render_game(game, ui, status, panel=None, flip=None, footer=(), message=None, tone=None, hint=None):
     width, height = terminal_width(), terminal_height()
     flip = ui.get("flip", False) if flip is None else flip
-    board_lines = build_board_lines(game, ui, flip)
+    cell_height = 2 if width >= MIN_WIDTH and height >= 30 + len(footer) else 1
+    cell_width = 5 if cell_height == 2 and width >= MIN_WIDTH + 16 else 3
+    board_lines = build_board_lines(game, ui, flip, cell_width, cell_height)
     info_lines = panel if panel is not None else build_info_lines(game, ui, status)
+    layout_width = MIN_WIDTH + 8 * (cell_width - 3)
 
     needed = len(board_lines) + 3 + len(footer)
     if width < MIN_WIDTH or height < needed:
@@ -813,12 +888,12 @@ def render_game(game, ui, status, panel=None, flip=None, footer=(), message=None
         ])
         return
 
-    pad = " " * ((width - MIN_WIDTH) // 2)
+    pad = " " * ((width - layout_width) // 2)
     show_title = height >= needed + 2
     lines = [""] * max(0, (height - needed - (2 if show_title else 0)) // 2)
     if show_title:
         title = "♔  C H E S S C O R E  ♚"
-        lines += [pad + " " * ((MIN_WIDTH - len(title)) // 2) + f"{GREEN}{title}{RESET}", ""]
+        lines += [pad + " " * ((layout_width - len(title)) // 2) + f"{GREEN}{title}{RESET}", ""]
     for index, board_line in enumerate(board_lines):
         info_index = index - 1
         info = " " * PANEL_GAP + info_lines[info_index] if 0 <= info_index < len(info_lines) else ""
@@ -930,7 +1005,11 @@ def run_menu(has_save):
     items = []
     if has_save:
         items.append(("Continue saved game", "continue"))
-    items += [("New game (two players, one screen)", "new"), ("Play online", "online"), ("Quit", "quit")]
+    items += [
+        ("New game (two players, one screen)", "new"),
+        ("Play against computer", "computer"),
+        ("Play online", "online"), ("Quit", "quit"),
+    ]
     return choose_menu(items, "quit")
 
 
@@ -1068,51 +1147,86 @@ def play_game(game):
     """Run one game. Returns 'menu' after the game ends or 'quit' to exit the program."""
     ui = new_ui()
     clear_screen()
+    engine = None
+    engine_level = None
+    try:
+        while True:
+            status = game_status(game)
 
-    while True:
-        status = game_status(game)
-
-        if status in FINAL_STATUSES:
-            clear_selection(ui)
-            text, tone = end_message(game, status)
-            say(ui, f"{text}  Press any key to return to the menu.", tone)
-            ui["modal"] = True
-            render_game(game, ui, status)
-            read_key()
-            return "menu"
-
-        render_game(game, ui, status)
-        key = read_key()
-        say(ui, "")
-
-        if key in CURSOR_STEPS:
-            ui["cursor"] = move_cursor(ui["cursor"], key, ui["flip"])
-        elif key == "SPACE":
-            game = handle_space(game, ui)
-        elif key == "ESC":
-            clear_selection(ui)
-        elif key == "F":
-            ui["flip"] = not ui["flip"]
-        elif key == "S":
-            if save_game(game):
-                say(ui, f"Game saved to {SAVE_FILE}.", "ok")
-            else:
-                say(ui, "Couldn't save the game. Check that the folder is writable.", "error")
-        elif key == "L":
-            loaded = load_game()
-            if loaded is None:
-                say(ui, f"No saved game found ({SAVE_FILE} is missing or damaged).", "error")
-            else:
-                game = loaded
+            if status in FINAL_STATUSES:
                 clear_selection(ui)
-                say(ui, "Saved game loaded.", "ok")
-        elif key == "QUIT":
-            choice = confirm_quit(game, ui)
+                text, tone = end_message(game, status)
+                say(ui, f"{text}  Press any key to return to the menu.", tone)
+                ui["modal"] = True
+                render_game(game, ui, status)
+                read_key()
+                return "menu"
+
+            level = game.get("computer")
+            try:
+                if level != engine_level:
+                    if engine is not None:
+                        stop_engine(engine)
+                        engine = None
+                    engine_level = level
+                    if level:
+                        engine = start_engine(stockfish_path())
+                        configure_engine(engine, level)
+                if level and game["turn"] == "b":
+                    say(ui, f"Stockfish ({level}) is thinking...", "info")
+                    render_game(game, ui, status)
+                    frm, to, promotion = engine_best_move(engine, game, COMPUTER_LEVELS[level][1])
+                    game = apply_move(game, frm, to, promotion or "q")
+                    clear_selection(ui)
+                    say(ui, f"Stockfish played {move_to_uci(frm, to, promotion)}.", "ok")
+                    continue
+            except (OSError, RuntimeError) as exc:
+                clear_selection(ui)
+                ui["modal"] = True
+                say(ui, f"Stockfish error: {exc}  Y save game; any other key returns to menu.", "error")
+                render_game(game, ui, status)
+                if read_key() == "Y" and not save_game(game):
+                    say(ui, "Couldn't save the game. Check that the folder is writable. Press any key.", "error")
+                    render_game(game, ui, status)
+                    read_key()
+                return "menu"
+
+            render_game(game, ui, status)
+            key = read_key()
             say(ui, "")
-            if choice == "save":
-                save_game(game)
-            if choice:
-                return "quit"
+
+            if key in CURSOR_STEPS:
+                ui["cursor"] = move_cursor(ui["cursor"], key, ui["flip"])
+            elif key == "SPACE":
+                game = handle_space(game, ui)
+            elif key == "ESC":
+                clear_selection(ui)
+            elif key == "F":
+                ui["flip"] = not ui["flip"]
+            elif key == "S":
+                if save_game(game):
+                    say(ui, f"Game saved to {SAVE_FILE}.", "ok")
+                else:
+                    say(ui, "Couldn't save the game. Check that the folder is writable.", "error")
+            elif key == "L":
+                loaded = load_game()
+                if loaded is None:
+                    say(ui, f"No saved game found ({SAVE_FILE} is missing or damaged).", "error")
+                else:
+                    game = loaded
+                    clear_selection(ui)
+                    say(ui, "Saved game loaded.", "ok")
+            elif key == "QUIT":
+                choice = confirm_quit(game, ui)
+                say(ui, "")
+                if choice == "save" and not save_game(game):
+                    say(ui, "Couldn't save the game. Check that the folder is writable.", "error")
+                    continue
+                if choice:
+                    return "quit"
+    finally:
+        if engine is not None:
+            stop_engine(engine)
 
 
 # ============================================================
@@ -1559,29 +1673,159 @@ def run_online_menu():
 # MAIN
 # ============================================================
 
+def crashing_outro():
+    for frame in ("CHESSCORE", "CH3SSC0RE", "CHESSC0RE", "CH3SSC0RE"):
+        print(f"\r{RED}  {frame}{RESET}", end="", flush=True)
+        time.sleep(0.03)
+    print()
+
+    messages = [
+        (RED, "[  12.481] chesscore[1]: ERROR: server heartbeat timeout"),
+        (YELLOW, "[  12.512] netmon[342]: packet loss exceeded threshold"),
+        (RED, "[  12.482] systemd[1]: chesscore.service: Main process exited, status=1/FAILURE"),
+        (RED, "[  12.517] postgres[812]: FATAL: connection reset by peer"),
+        (BLUE, "[  12.520] kernel: eth0 link up at 1000Mbps"),
+        (YELLOW, "[FAILED] Failed to start ChessCore game service."),
+        (RED, "[  12.483] systemd[1]: chesscore.service: Failed with result 'exit-code'."),
+        (YELLOW, "[  12.531] scheduler[119]: delayed task execution detected"),
+        (RED, "[  12.545] authd[241]: token validation failure"),
+        (RED, "[  12.601] chesscore[1]: matchmaking backend unreachable"),
+        (BLUE, "[  12.614] cachemgr[88]: cache refresh complete"),
+        (YELLOW, "[  12.622] monitor[19]: CPU usage exceeded 85%"),
+        (RED, "[  12.628] redis[401]: failed to write snapshot"),
+        (BLUE, "[  12.635] dns-resolver[72]: updated nameserver cache"),
+        (RED, "[  12.643] chesscore[1]: player session synchronization failed"),
+        (YELLOW, "[  12.650] kernel: high latency interrupt response"),
+        (RED, "[  12.661] systemd[1]: dependency failed for chesscore.service"),
+        (BLUE, "[  12.674] updater[220]: checking for updates"),
+        (YELLOW, "[  12.688] watchdog[9]: process restart attempt 2"),
+        (RED, "[  12.702] postgres[812]: unexpected shutdown detected"),
+        (BLUE, "[  12.719] inventory[33]: assets synchronized"),
+        (RED, "[  12.734] chesscore[1]: game state replication timeout"),
+        (YELLOW, "[  12.748] storage[155]: disk queue depth warning"),
+        (BLUE, "[  12.761] containerd[201]: image pull complete"),
+        (RED, "[  12.775] broker[54]: message delivery failed"),
+        (YELLOW, "[  12.791] monitor[19]: memory pressure detected"),
+        (RED, "[  12.804] chesscore[1]: opening-book service unavailable"),
+        (BLUE, "[  12.812] telemetry[16]: telemetry batch sent"),
+        (RED, "[  12.826] nginx[91]: upstream timed out"),
+        (YELLOW, "[  12.839] firewall[77]: excessive connection attempts"),
+        (RED, "[  12.851] authd[241]: user credential lookup failed"),
+        (BLUE, "[  12.867] kernel: scheduler tick restored"),
+        (RED, "[  12.880] chesscore[1]: ELO ranking service timeout"),
+        (YELLOW, "[  12.896] backupd[41]: backup window exceeded"),
+        (RED, "[  12.911] systemd[1]: chesscore.service: Start request repeated too quickly"),
+        (BLUE, "[  12.927] api-gateway[128]: route cache rebuilt"),
+        (RED, "[  12.943] dbproxy[63]: failed to acquire lock"),
+        (YELLOW, "[  12.958] monitor[19]: network jitter warning"),
+        (RED, "[  12.973] chesscore[1]: failed to initialize board engine"),
+        (BLUE, "[  12.988] metrics[202]: export successful"),
+        (RED, "[  13.004] redis[401]: replication link down"),
+        (YELLOW, "[  13.018] scheduler[119]: clock drift detected"),
+        (RED, "[  13.035] chesscore[1]: tournament coordinator unavailable"),
+        (BLUE, "[  13.049] netmon[342]: route convergence complete"),
+        (RED, "[  13.067] systemd[1]: Unit chesscore.service entered failed state"),
+        (YELLOW, "[  13.085] kernel: soft lockup warning"),
+        (RED, "[  13.098] postgres[812]: checkpoint write failure"),
+        (BLUE, "[  13.111] orchestrator[87]: scaling event completed"),
+        (RED, "[  13.127] chesscore[1]: websocket initialization failed"),
+        (YELLOW, "[  13.143] monitor[19]: thread starvation suspected"),
+        (RED, "[  13.157] broker[54]: queue overflow"),
+        (BLUE, "[  13.171] cachemgr[88]: cache warmup complete"),
+        (RED, "[  13.185] chesscore[1]: failed to load opening database"),
+        (YELLOW, "[  13.202] conntrack[61]: nearing table capacity"),
+        (RED, "[  13.216] authd[241]: session key mismatch"),
+        (BLUE, "[  13.229] telemetry[16]: diagnostics uploaded"),
+        (RED, "[  13.247] nginx[91]: upstream connection refused"),
+        (YELLOW, "[  13.262] kernel: packet reassembly timeout"),
+        (RED, "[  13.278] chesscore[1]: move validation service crashed"),
+        (BLUE, "[  13.293] updater[220]: repository metadata refreshed"),
+        (RED, "[  13.309] redis[401]: cluster slot unavailable"),
+        (YELLOW, "[  13.325] watchdog[9]: restart frequency threshold exceeded"),
+        (RED, "[  13.341] postgres[812]: relation corruption detected"),
+        (BLUE, "[  13.358] inventory[33]: state verification complete"),
+        (RED, "[  13.375] chesscore[1]: clock synchronization failure"),
+        (YELLOW, "[  13.389] monitor[19]: paging activity elevated"),
+        (RED, "[  13.407] dbproxy[63]: transaction rollback failure"),
+        (BLUE, "[  13.422] api-gateway[128]: endpoint cache refreshed"),
+        (RED, "[  13.437] chesscore[1]: analysis engine timeout"),
+        (YELLOW, "[  13.453] storage[155]: filesystem latency warning"),
+        (RED, "[  13.469] systemd[1]: Failed to restart chesscore.service"),
+        (BLUE, "[  13.485] kernel: cpu frequency scaling restored"),
+        (RED, "[  13.501] broker[54]: broker cluster partition detected"),
+        (YELLOW, "[  13.516] netmon[342]: asymmetric routing observed"),
+        (RED, "[  13.532] chesscore[1]: matchmaking queue corruption detected"),
+        (BLUE, "[  13.548] metrics[202]: collector synchronized"),
+        (RED, "[  13.564] authd[241]: kerberos negotiation failure"),
+        (YELLOW, "[  13.578] scheduler[119]: timing variance alert"),
+        (RED, "[  13.593] postgres[812]: replication lag critical"),
+        (BLUE, "[  13.611] containerd[201]: cleanup completed"),
+        (RED, "[  13.625] chesscore[1]: backend registry unavailable"),
+        (YELLOW, "[  13.641] monitor[19]: load average threshold exceeded"),
+        (RED, "[  13.657] nginx[91]: worker process crashed"),
+        (BLUE, "[  13.673] telemetry[16]: service heartbeat restored"),
+        (RED, "[  13.688] chesscore[1]: failed to bind control socket"),
+        (YELLOW, "[  13.704] firewall[77]: rule synchronization delayed"),
+        (RED, "[  13.719] systemd[1]: chesscore.service: Failed with result 'exit-code'."),
+        (BLUE, "[  13.737] kernel: network stack recovered"),
+        (RED, "[  13.751] redis[401]: master election failed"),
+        (YELLOW, "[  13.768] monitor[19]: process eviction imminent"),
+        (RED, "[  13.784] chesscore[1]: persistent storage unavailable"),
+        (BLUE, "[  13.799] updater[220]: update scan complete"),
+        (RED, "[  13.815] dbproxy[63]: query execution timeout"),
+        (YELLOW, "[  13.831] watchdog[9]: service instability detected"),
+        (RED, "[  13.846] chesscore[1]: cluster registration failed"),
+        (BLUE, "[  13.862] api-gateway[128]: health check passed"),
+        (RED, "[  13.879] postgres[812]: WAL archive failure"),
+        (YELLOW, "[  13.894] kernel: buffer exhaustion warning"),
+        (RED, "[  13.911] chesscore[1]: ERROR: server heartbeat timeout"),
+        (RED, "[  13.927] systemd[1]: chesscore.service: Main process exited, status=1/FAILURE"),
+        (YELLOW, "[FAILED] Failed to start ChessCore game service."),
+        (RED, "[  13.943] systemd[1]: chesscore.service: Failed with result 'exit-code'.")
+    ]
+    for color, message in messages:
+        print(f"{color}{message}{RESET}", flush=True)
+        time.sleep(0.02)
+
+
 def main():
     if msvcrt:
         os.system("")  # enables ANSI escape sequences in the Windows console
     saved_terminal = enter_raw_mode()
     print("\033[?25l", end="")
+    normal_exit = False
     try:
         boot()
         while True:
             saved = load_game()
             choice = run_menu(saved is not None)
             if choice == "quit":
+                normal_exit = True
                 break
             if choice == "online":
                 run_online_menu()
                 continue
             game = saved if choice == "continue" else new_game()
+            if choice == "computer":
+                level = choose_menu(
+                    [("Easy", "easy"), ("Intermediate", "intermediate"), ("Hard", "hard"), ("Back", None)],
+                    None, cancel_keys=("QUIT", "ESC"),
+                    hint="↑↓ move   Enter choose   Esc back", subtitle="CHOOSE DIFFICULTY",
+                )
+                if level is None:
+                    continue
+                game["computer"] = level
             if play_game(game) == "quit":
+                normal_exit = True
                 break
     finally:
         leave_raw_mode(saved_terminal)
         print("\033[?25h" + RESET, end="")
         clear_screen()
-        print("Session terminated.")
+        if normal_exit:
+            crashing_outro()
+        else:
+            print("Session terminated.")
 
 
 if __name__ == "__main__":

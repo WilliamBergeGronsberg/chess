@@ -4,8 +4,8 @@
 a = Analysis(
     ['ascii_chess.py'],
     pathex=[],
-    binaries=[],
-    datas=[],
+    binaries=[('stockfish\\stockfish.exe', 'stockfish')],
+    datas=[('stockfish\\Copying.txt', 'stockfish')],
     hiddenimports=['websockets.sync.client', 'websockets.exceptions'],
     hookspath=[],
     hooksconfig={},
